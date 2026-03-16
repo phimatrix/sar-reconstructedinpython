@@ -8,13 +8,7 @@ import os
 
 # Do NOT initialize here — fusion.py handles it
 # ee.Initialize(project='theta-arcana-484116-h7')
-
 import os
-
-os.environ['HTTP_PROXY'] = 'http://rrsceast:NRSC%40User@192.168.0.9:8080'
-os.environ['HTTPS_PROXY'] = 'http://rrsceast:NRSC%40User@192.168.0.9:8080'
-
-
 def prepare_optical(optical_collection, AOI, optical_mission):
     """
      Preprocess optical images

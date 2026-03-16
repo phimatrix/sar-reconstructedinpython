@@ -2,12 +2,25 @@
 This script performs GEE-based SAR-Optical fusion.
 """
 
+# ==============================
+# --- Proxy (if required) ---
+# ==============================
+
 import os
+
+os.environ['HTTP_PROXY'] = 'http://rrsceast:NRSC%40User@192.168.0.9:8080'
+os.environ['HTTPS_PROXY'] = 'http://rrsceast:NRSC%40User@192.168.0.9:8080'
+
+# ==============================
+# --- Imports ---
+# ==============================
+
 import json
+import time
 import ee
 import GEE_funcs
-from utilities import check_task_status
 import utilities
+from utilities import check_task_status
 
 
 # ==============================
@@ -27,7 +40,6 @@ else:
 # --- Initialize Earth Engine ---
 # ==============================
 
-# ✅ USE YOUR CLOUD PROJECT ID (NOT numeric)
 PROJECT_ID = "theta-arcana-484116-h7"
 
 ee.Initialize(project=PROJECT_ID)
@@ -47,7 +59,6 @@ if not os.path.exists(PARAM_FILE):
 with open(PARAM_FILE, 'r') as f:
     cfg = json.load(f)
 
-# ✅ Use your actual asset path
 AOI_PATH = cfg.get(
     "AOI_PATH",
     "projects/theta-arcana-484116-h7/assets/grid_123"
@@ -59,26 +70,25 @@ PROJECT_TITLE = cfg.get("PROJECT_TITLE", "GEE_Project")
 OPTICAL_MISSION = cfg.get("OPTICAL_MISSION", "S2")
 START_DATE = cfg.get("START_DATE", "2023-01-01")
 END_DATE = cfg.get("END_DATE", "2023-12-31")
+
 PCA_SMOOTH = cfg.get("PCA_SMOOTH", True)
 PCA_COMPONENT_RATIO = cfg.get("PCA_COMPONENT_RATIO", 0.9)
 STD_CLOUD_THRESHOLD = cfg.get("STD_CLOUD_THRESHOLD", 30)
 
 
 # ==============================
-# --- Define AOI ---
+# --- Run Fusion For AOI ---
 # ==============================
 
-AOI = ee.FeatureCollection(AOI_PATH).geometry()
+def run_for_aoi(aoi_path, aoi_id):
 
+    AOI = ee.FeatureCollection(aoi_path).geometry()
 
-def main():
+    print("Running fusion for:", aoi_id)
 
-    print(f"Project {PROJECT_TITLE} started.")
-    nameSuffix = f"_{OPTICAL_MISSION}_{START_DATE}_{END_DATE}"
-
-    # ==============================
-    # --- Manage GEE Assets ---
-    # ==============================
+    # ---------------------------
+    # Manage GEE Assets
+    # ---------------------------
 
     parent_folder = f"projects/{PROJECT_ID}/assets"
     subasset_folder = f"{parent_folder}/{PROJECT_TITLE}"
@@ -89,9 +99,9 @@ def main():
     if PROJECT_TITLE not in asset_names:
         ee.data.createAsset({'type': 'Folder'}, subasset_folder)
 
-    # ==============================
-    # --- Preprocess Optical Images ---
-    # ==============================
+    # ---------------------------
+    # Optical Collection
+    # ---------------------------
 
     optical_collection = ee.ImageCollection({
         'L8': "LANDSAT/LC08/C01/T1_SR",
@@ -101,16 +111,20 @@ def main():
         .filterDate(START_DATE, END_DATE)
 
     optical_collection = GEE_funcs.prepare_optical(
-        optical_collection, AOI, OPTICAL_MISSION
+        optical_collection,
+        AOI,
+        OPTICAL_MISSION
     )
 
     optical_collection = optical_collection.filterMetadata(
-        'PIXEL_COUNT_AOI', 'greater_than', 100
+        'PIXEL_COUNT_AOI',
+        'greater_than',
+        100
     )
 
-    # ==============================
-    # --- Preprocess SAR Images ---
-    # ==============================
+    # ---------------------------
+    # SAR Collection
+    # ---------------------------
 
     S1 = ee.ImageCollection('COPERNICUS/S1_GRD') \
         .filterBounds(AOI) \
@@ -120,9 +134,9 @@ def main():
         .filter(ee.Filter.eq('instrumentMode', 'IW')) \
         .select(['VV', 'VH'])
 
-    # ==============================
-    # --- Pairing ---
-    # ==============================
+    # ---------------------------
+    # Pairing
+    # ---------------------------
 
     indep_variables = [
         'VV_mean', 'VH_mean', 'VV_diff', 'VH_diff',
@@ -130,36 +144,36 @@ def main():
     ]
 
     opt_SAR = GEE_funcs.pair_opt_SAR(
-        optical_collection, S1, AOI, indep_variables
+        optical_collection,
+        S1,
+        AOI,
+        indep_variables
     )
 
     pair_count = opt_SAR.size().getInfo()
 
     if pair_count < 1:
         raise ValueError('No image pairs found.')
-    else:
-        print(f'Image pairs found: {pair_count}. Continuing regression...')
 
-    # ADD CONSTANT BAND HERE
+    print(f'Image pairs found: {pair_count}')
+
+    # ---------------------------
+    # Add constant band
+    # ---------------------------
+
     opt_SAR = opt_SAR.map(
-        lambda img: img.addBands(img.select(0).multiply(0).add(1).rename('constant')
+        lambda img: img.addBands(
+            img.select(0).multiply(0).add(1).rename('constant')
         )
     )
 
-    # ==============================
-    # --- Robust Linear Regression ---
-    # ==============================
-
-    opt_SAR_train = opt_SAR.filterMetadata(
-        'Split_label', 'not_equals', 'Testing'
-    )
-
-    opt_SAR_train = opt_SAR_train.map(
-        lambda img: img.updateMask(img.select('Mask').eq(0))
-    )
-    opt_SAR_train = opt_SAR_train.select(
+    opt_SAR_train = opt_SAR.select(
         ['constant'] + indep_variables + ['NDVI']
     )
+
+    # ---------------------------
+    # Robust Linear Regression
+    # ---------------------------
 
     robust_linear_regression = opt_SAR_train.reduce(
         ee.Reducer.robustLinearRegression(
@@ -174,37 +188,43 @@ def main():
         [['constant'] + indep_variables, ['NDVI']]
     )
 
-    # ==============================
-    # --- Prediction ---
-    # ==============================
+    # ---------------------------
+    # Prediction
+    # ---------------------------
 
     def MLR_predict(img):
+
         NDVI_pred = img.select(
             ['constant'] + indep_variables
         ).multiply(
             rlr_image.rename(['constant'] + indep_variables)
         ).reduce('sum').rename('NDVI_pred')
 
-        return img.select(['NDVI', 'Mask']).addBands(NDVI_pred)
+        return img.addBands(NDVI_pred)
 
     opt_SAR_outputs = opt_SAR.map(MLR_predict)
 
-    # ==============================
-    # --- PCA Smoothing ---
-    # ==============================
+    # ---------------------------
+    # PCA Smoothing
+    # ---------------------------
 
     if PCA_SMOOTH:
+
         NDVI_smoothed = GEE_funcs.Temporal_PCA(
             opt_SAR_outputs.select('NDVI_pred'),
             AOI,
             opt_SAR_outputs.size()
-                .multiply(PCA_COMPONENT_RATIO)
-                .floor()
-                .int(),
-            10
+            .multiply(PCA_COMPONENT_RATIO)
+            .floor()
+            .int(),
+            50
         )
+
     else:
-        NDVI_smoothed = opt_SAR_outputs.select('NDVI_pred').toBands()
+
+        NDVI_smoothed = opt_SAR_outputs.select(
+            'NDVI_pred'
+        ).toBands()
 
     NDVI_calibrated, NDVI_filled = GEE_funcs.post_process(
         opt_SAR_outputs,
@@ -213,21 +233,42 @@ def main():
         STD_CLOUD_THRESHOLD
     )
 
-    # ==============================
-    # --- Export ---
-    # ==============================
+    # ---------------------------
+    # Export
+    # ---------------------------
 
-    OutputFilled = NDVI_filled.select('NDVI').toBands().clip(AOI)
+    OutputFilled = NDVI_filled.select(
+        'NDVI'
+    ).toBands().clip(AOI)
 
     utilities.export_image_todrive(
         OutputFilled,
         AOI,
-        "Reconstructed_NDVI_July2023",
+        f"Reconstructed_NDVI_{aoi_id}",
         PROJECT_TITLE
     )
 
-    print("Processing and export complete!")
+    print("Export started for:", aoi_id)
 
 
-if __name__ == "__main__":
-    main()
+# ==============================
+# --- Loop Through All AOIs ---
+# ==============================
+
+for i in range(201, 251):
+
+    aoi_id = f"grid_{i}"
+
+    AOI_PATH = f"projects/{PROJECT_ID}/assets/{aoi_id}"
+
+    print("Processing:", AOI_PATH)
+
+    try:
+
+        run_for_aoi(AOI_PATH, aoi_id)
+
+        time.sleep(20)
+
+    except Exception as e:
+
+        print("Failed:", AOI_PATH, e)
